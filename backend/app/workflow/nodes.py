@@ -72,7 +72,10 @@ def prepare_investigation(state: dict)-> dict:
     if state.get("status")=="failed":
         return{
             "status":"failed",
-            "errors":state.get("errors",["Incident Validation Failed"])
+            "errors":state.get(
+                "errors",
+                ["Incident Validation Failed"]
+            )
         }
 
     # get incident
@@ -82,7 +85,7 @@ def prepare_investigation(state: dict)-> dict:
     if not isinstance(incident,dict) or not incident:
         return{
             "status":"failed",
-            "errors":["Cannot prepare investigation: incident data is missing or invalid"]
+            "errors":["cannot prepare investigation: incident data is missing or invalid"]
         }
 
     # ensure the incident ID exist
@@ -90,21 +93,53 @@ def prepare_investigation(state: dict)-> dict:
     if not isinstance(incident_id , str) or not incident_id.strip():
         return{
             "status":"failed",
-            "errors":["cannot prepare investigation: Incidet ID is missing"]
+            "errors":["Cannot prepare investigation: incident ID is missing"]
         }
 
     # ensure the incident has passed the validation
     if state.get("status")!="validated":
         return{
             "status":"failed",
-            "errors":["cannot prepare investigation: incident has not been validated"]
+            "errors":[
+                "Cannot prepare investigation: incident has not been validated"]
         }
 
     # prepare the incident for the next node
     return{
         "incident_id":incident_id,
         "incident":incident,
-        "evidences":state.get("evidence",[]),
+        "evidences":state.get("evidences",[]),
         "status":"prepared",
+        "errors":[]
+    }
+
+
+# NODE 4
+from datetime import datetime, timezone
+def mark_ready(state: dict)->dict:
+
+    # check the status of previous node
+    if state.get("status")=="failed":
+        return{
+            "status":"failed",
+            "errors":state.get("errors" , ["previous node failed"])
+        }
+
+    # ensure the investigation was prepared or not
+    if state.get("status") != "prepared":
+        return{
+            "status":"failed",
+            "errors":[
+                "Cannot make ready : investigation has not been prepared "
+            ]
+        }
+
+    # record completion time in utc
+    completed_at = datetime.now(timezone.utc).isoformat()
+
+    # update the workflow status
+    return{
+        "status":"READY",
+        "completed_at":completed_at,
         "errors":[]
     }
