@@ -11,7 +11,7 @@ EvidenceSourceType = Literal["UPLOAD", "BENCHMARK", "INTEGRATION"]
 
 
 class EvidenceCreate(BaseModel):
-    incident_id: UUID
+    incident_id: Optional[UUID] = None
     evidence_type: str = Field(min_length=1, max_length=50)
     source_type: EvidenceSourceType
     source_name: Optional[str] = None

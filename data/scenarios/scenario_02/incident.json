@@ -1,0 +1,7 @@
+{
+  "title": "Payment gateway memory leak and container OOMKilled",
+  "original_text": "The payment gateway pod entered a CrashLoopBackOff state due to an Out-Of-Memory (OOMKilled) condition. A newly introduced in-memory cache lacked TTL expiration, leading to unbounded heap consumption under moderate traffic.",
+  "affected_service": "payment-gateway",
+  "severity": "SEV2",
+  "started_at": "2026-10-25T11:15:00+05:30"
+}

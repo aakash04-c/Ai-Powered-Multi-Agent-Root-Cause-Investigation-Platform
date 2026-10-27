@@ -1,413 +1,293 @@
 # Data Contracts — Sprint 1
 ## AI-Powered Root Cause Investigation Platform
 
+---
+
 ## 1. Purpose
 
-This document defines the data structures and validation rules used in Sprint 1 of the AI-Powered Root Cause Investigation Platform.
+This document defines the authoritative data contracts, relational database schema, and validation rules used in **Sprint 1** of the **AI-Powered Root Cause Investigation Platform**.
 
-The purpose of these contracts is to ensure that incident data and supporting evidence follow a consistent format when they are received, validated, stored, and passed into the LangGraph workflow.
+The objective of these contracts is to ensure that incident telemetry and supporting evidence adhere to a consistent, strongly typed, and validated specification as they are ingested via REST APIs, stored in PostgreSQL, and orchestrated through the LangGraph state machine.
 
 For Sprint 1, the platform focuses on:
-- Defining a standard incident structure.
-- Defining a standard evidence structure.
-- Validating incoming data.
-- Associating evidence with the correct incident.
-- Preparing incident data for the LangGraph investigation workflow.
-- Supporting workflow state persistence and retrieval through a configured checkpointer.
+- Standardized, production-grade schema for **Incidents** and **Evidence Items**.
+- PostgreSQL relational tables with database-level integrity constraints (`CHECK`, `FOREIGN KEY`, `NOT NULL`, `INDEX`).
+- Pydantic models for API request boundary validation and response serialization.
+- Relational mapping between incidents and multi-source evidence.
+- State preparation and deterministic workflow progression via LangGraph.
+- State persistence and checkpoint retrieval using unique `thread_id` keys.
 
-The platform initially uses software engineering incidents as demonstration scenarios. The data contracts should remain reusable for other types of investigations in the future.
+---
 
 ## 2. Scope
 
-### In Scope
-- Incident data contract.
-- Evidence data contract.
-- Basic API request and response expectations.
-- Data validation rules.
-- LangGraph investigation state schema.
-- Incident and evidence association.
-- Basic workflow status tracking.
+### In Scope (Sprint 1)
+- Relational PostgreSQL schema (`incidents` and `evidence_items` tables).
+- Incident schema with standard SRE severities (`SEV1`–`SEV4`, `UNKNOWN`) and lifecycle statuses (`OPEN`, `INVESTIGATING`, `RESOLVED`, `CLOSED`).
+- Evidence schema supporting multi-modal ingestion (`UPLOAD`, `BENCHMARK`, `INTEGRATION`) with PostgreSQL `JSONB` for raw payloads.
+- REST API request and response data contracts (`IncidentCreate`, `IncidentResponse`, `EvidenceCreate`, `EvidenceResponse`).
+- Pure validation service and database check constraint enforcement.
+- LangGraph `InvestigationState` schema and node state transitions (`received` → `validated` → `prepared` → `READY`).
 
-### Out of Scope
-- AI-generated root-cause hypotheses.
-- Causal DAG construction.
-- Evidence relevance and reliability scoring.
-- Contradiction analysis.
-- Automated fix generation.
-- Final root-cause report schema.
+### Out of Scope (Deferred to Future Sprints)
+- LLM-generated root-cause hypotheses and candidate ranking.
+- Structural Causal Models (SCM) and directed acyclic graph (DAG) synthesis.
+- Autonomous contradiction detection and counterfactual reasoning.
+- Automated code patch generation and automated remediation verification.
+- Direct OAuth integrations with Jira, Slack, or GitHub.
 
-These features can be introduced in later sprints when their corresponding workflows are implemented.
+---
 
-## 3. Incident Data Contract
+## 3. Relational Database Schema
 
-An incident represents the problem that the platform is expected to investigate.
+The persistent storage layer uses **PostgreSQL**. Tables are defined via SQLAlchemy ORM in [backend/app/db/models.py](file:///c:/Users/Dhruv%20Lodhi/programs/EPAM/MAIN/root-cause-platform/backend/app/db/models.py).
 
-### 3.1 Fields
+### 3.1 Table: `incidents`
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `incident_id` | String | Yes | Unique identifier for the incident. |
-| `title` | String | Yes | Short description of the problem. |
-| `description` | String | Yes | Detailed description of the observed problem. |
-| `affected_service` | String | Yes | Service or component affected by the incident. |
-| `occurred_at` | ISO 8601 datetime | Yes | Time when the incident began or was first observed. |
-| `status` | String | Yes | Current incident lifecycle status. |
-| `severity` | String | No | Optional indication of incident impact. |
+Represents an observed system anomaly, outage, or performance degradation requiring investigation.
 
-### 3.2 Example
+| Column Name | PostgreSQL Type | Nullable | Default / Constraints | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `incident_id` | `UUID` | **No** | Primary Key (`gen_random_uuid()`) | Globally unique identifier for the incident. |
+| `title` | `VARCHAR(200)` | **No** | None | Brief, human-readable summary of the incident. |
+| `original_text` | `TEXT` | **No** | None | Comprehensive problem description or report. |
+| `affected_service` | `TEXT` | Yes | `NULL` | Component, microservice, or system impacted. |
+| `severity` | `VARCHAR(20)` | **No** | `'UNKNOWN'`<br>Check: `IN ('SEV1', 'SEV2', 'SEV3', 'SEV4', 'UNKNOWN')` | Standard engineering impact severity. |
+| `status` | `VARCHAR(20)` | **No** | `'OPEN'`<br>Check: `IN ('OPEN', 'INVESTIGATING', 'RESOLVED', 'CLOSED')` | Current incident lifecycle state. |
+| `started_at` | `TIMESTAMPTZ` | Yes | `NULL` | Timestamp when the incident was detected or began. |
+| `ended_at` | `TIMESTAMPTZ` | Yes | `NULL`<br>Check: `ended_at >= started_at` | Timestamp when the incident was resolved. |
+| `created_at` | `TIMESTAMPTZ` | **No** | `NOW()` | Audit record creation timestamp. |
+| `updated_at` | `TIMESTAMPTZ` | **No** | `NOW()` | Audit record last updated timestamp. |
+
+* **Indexes**:
+  * `idx_incidents_status_created` on `(status, created_at)` for high-performance filtering of active incidents.
+
+---
+
+### 3.2 Table: `evidence_items`
+
+Stores discrete telemetry artifacts, logs, metrics, or messages linked to an incident.
+
+| Column Name | PostgreSQL Type | Nullable | Default / Constraints | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `evidence_id` | `UUID` | **No** | Primary Key (`gen_random_uuid()`) | Unique platform identifier for the evidence record. |
+| `incident_id` | `UUID` | **No** | FK → `incidents.incident_id`<br>`ON DELETE RESTRICT` | Parent incident reference. |
+| `evidence_type` | `VARCHAR(50)` | **No** | None | Classification (e.g., `application_log`, `ticket`, `metric`, `slack_message`). |
+| `source_type` | `VARCHAR(30)` | **No** | Check: `IN ('UPLOAD', 'BENCHMARK', 'INTEGRATION')` | Channel through which evidence entered the platform. |
+| `source_name` | `TEXT` | Yes | `NULL` | External origin system (e.g., `"jira"`, `"datadog"`, `"slack"`). |
+| `source_record_id` | `TEXT` | Yes | `NULL` | External locator ID (e.g., `"JIRA-501"`, `"DEPLOY-204"`). |
+| `event_time` | `TIMESTAMPTZ` | Yes | `NULL` | Timestamp of the event in the original source system. |
+| `ingested_at` | `TIMESTAMPTZ` | **No** | `NOW()` | Timestamp when stored into the platform. |
+| `excerpt` | `TEXT` | Yes | `NULL` | Short extracted snippet or human-readable summary. |
+| `original_ref` | `TEXT` | Yes | `NULL` | External URL, permalink, or log bucket URI. |
+| `content_hash` | `TEXT` | Yes | `NULL` | Hash (SHA-256) of raw content for deduplication. |
+| `reliability_score` | `NUMERIC(5,4)`| Yes | Check: `0.0000 <= score <= 1.0000` | Normalized confidence score (0 to 1). |
+| `payload` | `JSONB` | **No** | `'{}'::jsonb` | Complete, unstructured/semi-structured raw payload. |
+
+* **Indexes**:
+  * `idx_evidence_incident_event` on `(incident_id, event_time)` for chronological event stream generation.
+
+---
+
+## 4. Incident Data Contract
+
+### 4.1 Allowed Severities & Definitions
+
+| Severity | Definition | Operational Example |
+| :--- | :--- | :--- |
+| `SEV1` | **Critical Outage**: Catastrophic impact on core user-facing functionality or business revenue. Immediate war-room. | Entire checkout service down; payment processing failing for all customers. |
+| `SEV2` | **Major Degradation**: Significant customer impact or partial system failure without full outage. | 40% of API calls timing out; background inventory sync failing. |
+| `SEV3` | **Minor Issue**: Low-to-moderate degradation with functional workaround available. | Latency spikes on internal reporting dashboard. |
+| `SEV4` | **Low Impact / Cosmetic**: Minor bug or nuisance with minimal operational consequence. | Styling issue on non-critical admin settings page. |
+| `UNKNOWN` | **Unassessed**: Initial triage state prior to impact assessment. | Newly ingested synthetic or uncategorized telemetry. |
+
+### 4.2 Allowed Lifecycle Statuses
+
+* `OPEN`: Incident is recorded but active investigation has not commenced.
+* `INVESTIGATING`: Workflow has started; evidence is being analyzed.
+* `RESOLVED`: Root cause identified and mitigating action applied.
+* `CLOSED`: Post-incident review completed; record archived.
+
+### 4.3 Incident JSON Example
 
 ```json
 {
-  "incident_id": "INC-001",
+  "incident_id": "c1f8a847-a8d2-4b2a-89bc-9937bc38d9b1",
   "title": "Database connection pool exhausted",
-  "description": "The order service started returning API errors because database connections were unavailable. Request latency increased, and some requests timed out.",
+  "original_text": "The order service started returning HTTP 500 errors because PostgreSQL connections were saturated. Latency escalated to >10s.",
   "affected_service": "order-service",
-  "occurred_at": "2026-10-23T14:30:00Z",
-  "status": "pending",
-  "severity": "high"
+  "severity": "SEV1",
+  "status": "OPEN",
+  "started_at": "2026-10-24T09:30:00+05:30",
+  "ended_at": null,
+  "created_at": "2026-10-24T09:35:12+05:30",
+  "updated_at": "2026-10-24T09:35:12+05:30"
 }
 ```
 
-This is a synthetic demonstration incident, not a real production incident.
+---
 
-### 3.3 Validation Rules
+## 5. Evidence Data Contract
 
-- `incident_id` must be non-empty and unique.
-- `title`, `description`, and `affected_service` must not be empty.
-- `occurred_at` must be a valid ISO 8601 datetime with timezone information.
-- `status` must use an explicitly defined set of allowed values.
-- If provided, `severity` must be one of the following values:
-  - `low`
-  - `medium`
-  - `high`
-  - `critical`
+### 5.1 Ingestion Sources (`source_type`)
 
-### 3.4 Severity Definitions
+* `UPLOAD`: File or snippet manually submitted by a human engineer via API or UI.
+* `BENCHMARK`: Curated scenario datasets (e.g., from `data/scenarios/`) used for regression testing.
+* `INTEGRATION`: Automated webhooks or scheduled pollers from external tools (Jira, Slack, Datadog).
 
-| Severity | Meaning | Example |
-|---|---|---|
-| `low` | Minimal impact on the system or users. | A minor warning with no noticeable user impact. |
-| `medium` | Noticeable but limited impact. | An API is slow, but most requests succeed. |
-| `high` | Significant impact on users or an important service. | Many users experience failed order requests. |
-| `critical` | Severe impact, such as a major service outage. | The entire ordering system is unavailable. |
-
-These definitions are initial project conventions and can be refined as the platform develops.
-
-### 3.5 Incident Lifecycle Status
-
-For the initial implementation, the incident status may use:
-- `pending`
-- `investigating`
-- `resolved`
-- `closed`
-
-These values describe the incident lifecycle. They should not be confused with severity or LangGraph workflow execution status.
-
-## 4. Evidence Data Contract
-
-Evidence represents a record of information that may help explain an incident.
-
-During Sprint 1, evidence can originate from:
-- Jira incident tickets.
-- Deployment logs.
-- Slack incident threads.
-- Metrics.
-
-Evidence must be stored separately from the incident so that multiple evidence records can be associated with one incident.
-
-### 4.1 Fields
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `evidence_id` | String | Yes | Unique identifier assigned to the evidence record by our platform. |
-| `incident_id` | String | Yes | Identifier of the incident associated with the evidence. |
-| `source` | String | Yes | Origin of the evidence. |
-| `timestamp` | ISO 8601 datetime | Yes | Time associated with the original event, message, or record. |
-| `content` | String | Yes | Text or relevant information extracted from the source. |
-| `source_reference` | String or null | No | Identifier or locator for the original source record. |
-
-### 4.2 Example
+### 5.2 Evidence JSON Example
 
 ```json
 [
   {
-    "evidence_id": "EV-001",
-    "incident_id": "INC-001",
-    "source": "jira",
-    "timestamp": "2026-10-23T14:35:00Z",
-    "content": "Multiple users report order API timeouts. Database connection acquisition is failing.",
-    "source_reference": "JIRA-501"
+    "evidence_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "incident_id": "c1f8a847-a8d2-4b2a-89bc-9937bc38d9b1",
+    "evidence_type": "ticket",
+    "source_type": "INTEGRATION",
+    "source_name": "jira",
+    "source_record_id": "JIRA-501",
+    "event_time": "2026-10-24T09:32:00+05:30",
+    "ingested_at": "2026-10-24T09:35:40+05:30",
+    "excerpt": "Multiple users reporting timeouts when placing orders during checkout.",
+    "original_ref": "https://jira.company.com/browse/JIRA-501",
+    "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reliability_score": 0.9500,
+    "payload": {
+      "reporter": "alice@company.com",
+      "priority": "Highest",
+      "components": ["checkout", "order-api"]
+    }
   },
   {
-    "evidence_id": "EV-002",
-    "incident_id": "INC-001",
-    "source": "deployment_log",
-    "timestamp": "2026-10-23T14:20:00Z",
-    "content": "Database connection pool maximum was changed from 100 to 20 during deployment.",
-    "source_reference": "DEPLOY-204"
-  },
-  {
-    "evidence_id": "EV-003",
-    "incident_id": "INC-001",
-    "source": "slack",
-    "timestamp": "2026-10-23T14:38:00Z",
-    "content": "The team reports that connection usage reached the configured limit shortly after deployment.",
-    "source_reference": "SLACK-MSG-88"
+    "evidence_id": "8f2a1b9c-4d5e-6f7a-8b9c-0d1e2f3a4b5c",
+    "incident_id": "c1f8a847-a8d2-4b2a-89bc-9937bc38d9b1",
+    "evidence_type": "application_log",
+    "source_type": "BENCHMARK",
+    "source_name": "kubernetes_deployment",
+    "source_record_id": "DEPLOY-204",
+    "event_time": "2026-10-24T09:25:00+05:30",
+    "ingested_at": "2026-10-24T09:35:41+05:30",
+    "excerpt": "Database pool config updated: max_connections decreased from 100 to 20.",
+    "original_ref": "arn:aws:logs:us-east-1:123456789:log-group:order-service",
+    "content_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
+    "reliability_score": 1.0000,
+    "payload": {
+      "environment": "production",
+      "commit": "a4f890c",
+      "author": "devops-bot"
+    }
   }
 ]
 ```
 
-All records above are synthetic examples created for demonstration purposes.
+---
 
-### 4.3 Allowed Sources
+## 6. Identifier Disambiguation
 
-The `source` field must use one of the following values:
+To ensure clean system boundaries and traceability:
 
-| Value | Meaning |
-|---|---|
-| `jira` | Evidence originating from Jira. |
-| `deployment_log` | Evidence originating from deployment logs. |
-| `slack` | Evidence originating from Slack incident threads. |
+* **`incident_id`**: Internal platform UUID identifying the overarching incident.
+* **`evidence_id`**: Internal platform UUID identifying a specific evidentiary item.
+* **`source_record_id`**: External identifier assigned by the originating system (e.g., `"JIRA-501"`, `"DEPLOY-204"`, Slack message ID).
+* **`original_ref`**: URI, permalink, or pointer allowing human engineers or automated agents to inspect the raw external source.
+* **`thread_id`**: Execution identifier used exclusively by LangGraph checkpointers to track and retrieve state transitions.
 
-Additional sources may be introduced in future iterations if required.
+---
 
-### 4.4 Validation Rules
+## 7. API Schemas & Boundaries
 
-- `evidence_id` must be non-empty and unique.
-- `incident_id` must reference an existing incident.
-- `source` must match one of the allowed source values.
-- `timestamp` must be a valid ISO 8601 datetime with timezone information.
-- `content` must not be empty.
-- `source_reference` may be null when the original system does not provide a usable reference.
-- Evidence must remain associated with its corresponding incident during storage and retrieval.
+API models are validated with Pydantic v2 in [backend/app/schemas/](file:///c:/Users/Dhruv%20Lodhi/programs/EPAM/MAIN/root-cause-platform/backend/app/schemas/).
 
-The platform must not treat evidence as confirmed proof of a root cause merely because it has been ingested.
+### 7.1 Incident Schemas
+* **`IncidentCreate`**:
+  * `title`: `str` (1–200 characters)
+  * `original_text`: `str` (minimum 1 character)
+  * `affected_service`: `Optional[str]`
+  * `severity`: `Severity` (default: `"UNKNOWN"`)
+  * `started_at`: `Optional[datetime]`
+  * `ended_at`: `Optional[datetime]`
+* **`IncidentResponse`**: Returns all fields including `incident_id`, `created_at`, `updated_at`, and `status`.
 
-## 5. Meaning of `source_reference`
+### 7.2 Evidence Schemas
+* **`EvidenceCreate`**:
+  * `incident_id`: `UUID`
+  * `evidence_type`: `str` (1–50 characters)
+  * `source_type`: `EvidenceSourceType` (`"UPLOAD" | "BENCHMARK" | "INTEGRATION"`)
+  * `source_name`: `Optional[str]`
+  * `source_record_id`: `Optional[str]`
+  * `event_time`: `Optional[datetime]`
+  * `excerpt`: `Optional[str]`
+  * `original_ref`: `Optional[str]`
+  * `reliability_score`: `Optional[Decimal]` (0.0 to 1.0)
+  * `payload`: `Dict[str, Any]` (default: `{}`)
+* **`EvidenceResponse`**: Returns all stored columns including `evidence_id` and `ingested_at`.
 
-The `source_reference` field identifies the original record from which the evidence was obtained.
+---
 
-Examples:
-- Jira issue key, such as `JIRA-501`.
-- Deployment identifier or log record ID, such as `DEPLOY-204`.
-- Slack message ID, thread ID, or permalink.
+## 8. LangGraph Investigation State Machine
 
-The distinction between identifiers is important:
+Defined in [backend/app/workflow/state.py](file:///c:/Users/Dhruv%20Lodhi/programs/EPAM/MAIN/root-cause-platform/backend/app/workflow/state.py).
 
-- `incident_id` identifies an incident within our platform.
-- `evidence_id` identifies an evidence record within our platform.
-- `source_reference` identifies or locates the original record in an external source system.
-
-For Sprint 1, storing source references is sufficient. Automatic navigation to or retrieval from external systems is not required unless included in the agreed ingestion scope.
-
-## 6. Evidence Collection Format
-
-An incident may contain multiple evidence records. The evidence collection format groups those records for loading and processing.
-
-For the initial scenario-based implementation, evidence may be represented as a JSON array in an `evidences.json` file.
-
-Example directory structure:
-
-```text
-data/
-└── scenarios/
-    └── database_connection_leak/
-        ├── incident.json
-        └── evidences.json
-```
-
-The scenario directory groups the sample files for testing and demonstration. In persistent storage, incidents and evidence records should be stored separately and associated through `incident_id`.
-
-## 7. API Request and Response Expectations
-
-The API layer is responsible for validating external input and returning predictable responses.
-
-### 7.1 Create Incident Request
-
-The incident creation endpoint should accept a payload matching the incident data contract.
-
-Example:
-
-```http
-POST /api/v1/incidents
-Content-Type: application/json
-```
-
-Request body:
-
-```json
-{
-  "incident_id": "INC-001",
-  "title": "Database connection pool exhausted",
-  "description": "The order API is experiencing database connection timeouts.",
-  "affected_service": "order-service",
-  "occurred_at": "2026-10-23T14:30:00Z",
-  "status": "pending",
-  "severity": "high"
-}
-```
-
-The final endpoint path and whether `incident_id` is client-generated or server-generated must be consistent with the implemented API design.
-
-### 7.2 Response Expectations
-
-A successful creation response should provide:
-- The incident identifier.
-- The accepted incident details or a reference to the created incident.
-- A clear success status.
-
-Invalid input should produce an appropriate HTTP error response with a useful validation message.
-
-The API should not expose stack traces, credentials, or sensitive internal information in error responses.
-
-## 8. LangGraph Investigation State
-
-The LangGraph state defines the information carried between nodes during an investigation workflow.
-
-It is a workflow schema, not a replacement for the incident or evidence data contracts.
-
-### 8.1 Initial State Schema
+### 8.1 State Schema
 
 ```python
 from typing import TypedDict
 
 
-class InvestigationState(TypedDict):
+class InvestigationState(TypedDict, total=False):
     incident_id: str
     incident: dict
     evidences: list[dict]
     status: str
     errors: list[str]
+    completed_at: str
 ```
 
-### 8.2 Field Descriptions
+### 8.2 State Lifecycle Transitions
 
-| Field | Type | Purpose |
-|---|---|---|
-| `incident_id` | String | Identifies the incident being processed. |
-| `incident` | Dictionary | Holds the validated incident details. |
-| `evidences` | List of dictionaries | Holds the evidence records loaded for the incident. |
-| `status` | String | Tracks the current workflow stage. |
-| `errors` | List of strings | Stores validation or processing errors. |
-
-This schema is intentionally minimal for Sprint 1. Dedicated nested types may replace generic dictionaries as the implementation matures.
-
-### 8.3 Example Workflow Status Values
-
-The initial workflow may use these values:
-
-- `received`: The incident has entered the workflow.
-- `evidence_loaded`: Evidence has been retrieved and added to the state.
-- `ready`: Required preparation and validation have completed.
-- `failed`: A blocking error prevented the workflow from completing preparation.
-
-These values describe workflow execution. They do not replace the incident lifecycle status.
-
-### 8.4 State Updates
-
-LangGraph nodes may return partial state updates instead of reconstructing the entire state.
-
-For example:
-
-```python
-return {
-    "evidences": loaded_evidences,
-    "status": "evidence_loaded"
-}
+```text
+  [Input Incident Payload]
+              │
+              ▼
+    receive_incident   ──(failed)──► [END]
+              │
+              ▼
+    validate_incident  ──(failed)──► [END]
+              │
+              ▼
+  prepare_investigation ──(failed)──► [END]
+              │
+              ▼
+         mark_ready
+              │
+              ▼
+            [READY]
 ```
 
-LangGraph applies the node's updates to the existing state according to the graph's state update semantics and any configured reducers.
+* **`received`**: Initial node confirms incident presence and extracts `incident_id`.
+* **`validated`**: Incident passes data validation rules via [incident_validator.py](file:///c:/Users/Dhruv%20Lodhi/programs/EPAM/MAIN/root-cause-platform/backend/app/services/incident_validator.py).
+* **`prepared`**: Evidence and incident context are structured for causal analysis.
+* **`READY`**: Pipeline completes preparation; injects UTC ISO `completed_at` timestamp.
+* **`failed`**: Any validation or state anomaly terminates graph execution with populated `errors` list.
 
-## 9. Persistence and Thread Identification
+---
 
-Sprint 1 must demonstrate that investigation state can be persisted and retrieved.
+## 9. State Persistence & Checkpointing
 
-A configured LangGraph checkpointer saves graph state at checkpoints. A persistent checkpointer implementation must be selected and configured to retain that state in the intended storage system.
+* LangGraph workflows are executed with runtime configuration binding to a stable `thread_id`:
+  ```python
+  config = {"configurable": {"thread_id": f"investigation-{incident_id}"}}
+  ```
+* Sprint 1 uses persistent checkpointing (`PostgresSaver` / `MemorySaver`) to allow retrieving point-in-time state snapshots via `GET /api/incidents/{id}/state`.
 
-The graph should be invoked with a stable `thread_id` through its runtime configuration.
+---
 
-Example:
+## 10. Sprint 1 Acceptance Criteria
 
-```python
-config = {
-    "configurable": {
-        "thread_id": "investigation-INC-001"
-    }
-}
-```
-
-The incident ID and thread ID serve different purposes:
-
-- `incident_id` identifies the problem being investigated.
-- `thread_id` identifies the LangGraph execution history used for checkpointing and resumption.
-
-The thread ID must remain consistent when retrieving or resuming the same investigation. A checkpointer and suitable storage configuration are required; defining a `TypedDict` alone does not provide persistence.
-
-## 10. Data Validation and Consistency
-
-Validation should occur before invalid data is stored or passed into the workflow.
-
-The initial implementation should check:
-
-1. Required fields are present.
-2. Field values have the expected types.
-3. Identifiers are unique within their intended scope.
-4. Datetimes are valid and timezone-aware.
-5. Evidence source values belong to the supported set.
-6. Evidence references an existing incident.
-7. Severity, when provided, is one of `low`, `medium`, `high`, or `critical`.
-8. Incident status uses an allowed value.
-9. Empty or malformed content is rejected where required.
-10. Invalid data produces clear, structured error responses.
-
-Pydantic models should be used for API-boundary validation. Database constraints should enforce appropriate uniqueness and relationship rules where supported.
-
-Validation must not assume that syntactically valid evidence is factually correct.
-
-## 11. Data Storage Principles
-
-The initial data design follows these principles:
-
-- Incident records and evidence records remain logically separate.
-- Each evidence record is associated with an incident using `incident_id`.
-- External source identifiers are retained when available.
-- Incident and evidence timestamps use consistent timezone-aware representations.
-- Only the data needed for the current workflow should be loaded into LangGraph state.
-- Checkpoint persistence is configured separately from the incident and evidence storage design.
-
-The final database tables, collections, and checkpoint storage implementation should be documented in the architecture and database design documents.
-
-## 12. Sprint 1 Acceptance Criteria
-
-The data-contract implementation is considered complete when:
-
-- [ ] Incident and evidence schemas are defined.
-- [ ] Required fields and allowed values are documented.
-- [ ] Synthetic incident and evidence fixtures are available.
-- [ ] Invalid payloads fail validation with useful errors.
-- [ ] Evidence records are associated with the correct incident.
-- [ ] Incident and evidence data can be loaded through the intended ingestion path.
-- [ ] Validated data can initialize and update the LangGraph state.
-- [ ] Workflow status and processing errors can be represented in state.
-- [ ] A configured checkpointer can persist and retrieve state using the same `thread_id`.
-- [ ] Tests cover valid input, invalid input, evidence association, and checkpoint retrieval.
-
-## 13. Future Extensions
-
-The following contracts and fields may be added in later sprints when the corresponding capabilities are implemented:
-
-- Hypothesis contract for proposed root causes and supporting evidence.
-- Evidence evaluation contract for relevance, reliability, and contradictory information.
-- Causal graph contract for causal nodes and directed relationships.
-- Investigation result contract for final findings and recommendations.
-- Additional source metadata for richer external traceability.
-
-These extensions are intentionally excluded from the Sprint 1 implementation scope.
-
-## 14. Summary
-
-Sprint 1 establishes a consistent data foundation for the AI Root Cause Investigation Platform.
-
-The incident contract defines the problem, the evidence contract defines the supporting records, the API layer validates incoming data, and the LangGraph state schema defines the data carried through the workflow.
-
-Together, these components allow the team to demonstrate incident ingestion, evidence association, workflow preparation, and checkpoint persistence before introducing AI-driven causal investigation in subsequent sprints.
+- [x] Relational database schema with PostgreSQL constraints implemented in `models.py`.
+- [x] Strong Pydantic request/response boundary models defined in `schemas/`.
+- [x] Pure incident validation service with timezone and constraint validation in `incident_validator.py`.
+- [x] LangGraph deterministic 4-node pipeline with conditional fail-fast routing in `graph.py` and `nodes.py`.
+- [x] CRUD repository functions with PostgreSQL session management in `repositories.py`.
+- [x] Comprehensive automated test coverage (22 tests passing) across health checks, repositories, graph nodes, and end-to-end graph invocation.
+- [x] Authoritative, aligned Data Contract documentation in `docs/data-contract.md`.
